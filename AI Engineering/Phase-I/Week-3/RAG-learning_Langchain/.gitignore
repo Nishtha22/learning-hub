@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Pytest
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Editor/OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Environment variables
+.env
+
+# FAISS and index artifacts
+**/faiss_langchain/
+*.faiss
+faiss_index_chunks.json
+
+# Large chunk/embedding files (optional)
+**/data/step3/*embeddings*

@@ -1,0 +1,7 @@
+SOURCE: https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
+================================================================================
+
+Structured Streaming Programming Guide
+As of Spark 4.0.0, the Structured Streaming Programming Guide has been broken apart into smaller, more readable pages. You can find these pages
+here
+.
