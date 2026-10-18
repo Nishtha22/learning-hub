@@ -1,0 +1,345 @@
+Week 1 Review
+A recap of our live walkthrough of Week 1 topics: FastAPI & Pydantic, Layered Architecture, Async Python, Error Handling & Middleware, and pytest. Each section includes the core explanation plus the actual questions asked during the session and the corrected/confirmed answers, so you can use it to self-check.
+Topic 1: FastAPI and Pydantic
+The big picture
+An API is a way for two programs to talk: client sends a request, FastAPI app receives it, sends back a response.
+Why FastAPI:
+1. Reads Python type hints and automatically validates incoming data.
+2. Generates interactive docs for free (/docs).
+3. Supports async def for handling many requests efficiently.
+The smallest example
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/hello")
+def say_hello():
+    return {"message": "Hello"}
+@app.get("/hello") means: when someone visits this address using a GET request, run the function below it. This is a decorator, and "/hello" is the address.
+Q: What does @app.post("/ask") mean? A: When someone sends a POST request to the address /ask, run the function below it.
+• GET — client wants to retrieve something, usually no body, just the URL.
+• POST — client wants to send data to be processed; the data travels in the request body, not the URL.
+Query parameters vs. request body
+Q: What would the body of a POST to /v1/ask look like for "How do I reset my password?"
+Two different things:
+• Query parameter (URL-attached): GET /v1/docs?id=5
+• Request body (POST, separate from URL):
+POST /v1/ask
+{
+  "question": "How do I reset my password?"
+}
+Analogy: the URL is the address on the envelope; the body is the letter inside.
+Q: Why not cram the whole question into the URL as a query parameter? A: Because it's not a tiny value — the question could be long, so it's embedded as data in the POST body instead. Additional reasons: URLs have a length limit (~2000 characters), and URLs get logged everywhere (browser history, server logs, proxies), so sensitive or large data in a URL is risky and fragile.
+Pydantic — the bouncer at the door
+Pydantic lets you describe the exact shape of data you expect, and it automatically checks incoming data against that shape, rejecting anything that doesn't fit.
+from pydantic import BaseModel
+
+class AskRequest(BaseModel):
+    question: str
+This means: a valid request body must be an object with a field called question, and its value must be text.
+Q: Would {"question": 123} be accepted or rejected? A: Accepted — Pydantic converts 123 into the string "123". This is called type coercion: Pydantic tries to be helpful and converts values that can be reasonably converted, rather than rejecting them outright. Things with no sensible conversion (a nested object, a list) get rejected with a 422.
+Rule of thumb: Pydantic rejects when a value has no reasonable conversion to the expected type, not simply when the type is technically different.
+Q: Would {"question": null} be accepted or rejected? A: Rejected. question: str with no extra marking means the field is required AND must be a string. None is not a string, and there's no sensible text to produce from nothing.
+To actually allow null, you must say so explicitly:
+class AskRequest(BaseModel):
+    question: str              # required, must be a real string, null rejected
+class AskRequest(BaseModel):
+    question: str | None = None   # explicitly optional, defaults to None
+Q: Would {} (empty object, no question key) be accepted or rejected? A: Rejected — question is a required field (no default given) and it's missing entirely. There's a difference between a field being present but null, and missing entirely — both are rejected here, for the same core reason: no actual string value satisfies question: str.
+Validation summary table:
+Request body
+Accepted or rejected
+Why
+{"question": "hi"}
+Accepted
+Correct type
+{"question": 123}
+Accepted, becomes "123"
+Coerced to string
+{"question": null}
+Rejected
+No value to satisfy required string
+{}
+Rejected
+Field missing entirely
+{"question": [1,2]}
+Rejected
+Can't convert a list to a string
+Field constraints
+from pydantic import BaseModel, Field
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=500)
+Field(...) lets you attach extra rules to a field beyond its type. min_length=3 requires at least 3 characters; max_length=500 caps it at 500.
+Q: Would {"question": "hi"} be accepted now? A: Rejected — "hi" has 2 characters, less than min_length=3.
+Q: Would {"question": "   "} (three spaces) be accepted? A: Accepted by Field(min_length=3) — Field only checks the length of the string, not whether the characters are meaningful. Three space characters is still a string of length 3.
+Custom validators — closing the gap
+from pydantic import field_validator
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=500)
+
+    @field_validator("question")
+    @classmethod
+    def not_blank(cls, v):
+        if not v.strip():
+            raise ValueError("question must not be blank")
+        return v
+Field() checks structural things (type, length). A @field_validator lets you write custom rules in plain Python for anything Field() can't express, like "not just whitespace."
+.strip() removes whitespace from both ends. "   ".strip() becomes "", and not "" is True, so it raises.
+Q: Would "  hi  " pass this validator? A: Yes — "  hi  ".strip() becomes "hi", not empty, so the validator doesn't raise. Note: the validator returns the original v, not the stripped version — it only used .strip() to check, the stored value keeps its spaces unless you explicitly return v.strip().
+Q: If three spaces is accepted, how is the field still "required"? A: "Required" only means a value must be present and match the type/length rules — not that it must be meaningful. question: str = Field(min_length=3, ...) only checks: is the key present, and is the value a string of at least 3 characters. Three spaces satisfies both. The gap between "structurally valid" and "meaningful content" is exactly what a custom validator closes.
+Analogy: a form saying "Name: required, at least 3 letters" is technically satisfied by "---". The form didn't say "must be a real name."
+Response models
+class AskResponse(BaseModel):
+    answer: str
+    source_ids: list[str]
+
+@app.post("/v1/ask", response_model=AskResponse)
+def ask(request: AskRequest):
+    ...
+    return AskResponse(answer="...", source_ids=["doc1"])
+Two reasons this matters:
+1. It's a contract — callers know exactly what fields to expect back, always.
+2. It's a safety net — FastAPI strips any field not declared in AskResponse before sending the response out.
+Q: If the route accidentally returned an extra internal_debug_info field, what would the client receive? A: The client would not receive it — it's silently dropped. response_model actively filters the output, matching the returned object against the declared fields and only serializing those.
+Analogy: response_model is a strict packing list. Only items on the list get packed into the box that ships; anything else stays behind.
+Q: If AskResponse requires source_ids but the function forgets to include it, what happens? A: It throws an error — specifically a ResponseValidationError (treated as a 500), because the server's own code broke its own promised contract. This is a server-side error, not a 422 (422s are for incoming request validation).
+Topic 2: Layered Architecture
+The problem this solves
+Q: What happens if request handling, business logic, and talking to the LLM all live inside one route function? A: It works at first but becomes hard to test, hard to reuse, and hard to change — everything is tangled together and pieces can't be pulled apart easily.
+The three layers
+• Routes — the entry point. Receives the HTTP request, validates with Pydantic, calls the right service, shapes the response. Almost no logic.
+• Services — the brain. Contains actual business logic — what should happen, in what order, with what rules. Knows nothing about HTTP.
+• Clients — the hands. Talks to the outside world (LLM API, database, another service). The only layer that knows how to make that external call.
+Flow: Route calls Service, Service calls Client. Never the reverse.
+Q: Where should the actual decision-making logic ("how do we answer this question") live? A: In services — that's the layer responsible for business rules.
+Seeing it in code
+# routes/ask.py
+@app.post("/v1/ask", response_model=AskResponse)
+def ask(request: AskRequest, qa_service=Depends(get_qa_service)):
+    return qa_service.answer_question(request.question)
+
+# services/qa_service.py
+class QAService:
+    def __init__(self, llm_client):
+        self.llm_client = llm_client
+
+    async def answer_question(self, question: str):
+        docs = self.doc_store.search(question)
+        answer = await self.llm_client.complete(question, docs)
+        return AskResponse(answer=answer, source_ids=[d.id for d in docs])
+
+# clients/llm.py
+class LLMClient:
+    async def complete(self, question: str, docs: list) -> str:
+        # actual API call to OpenAI/Anthropic happens here
+        ...
+The route doesn't know how an answer is produced — it trusts the service. The service doesn't know how the LLM API works — it trusts the client. Each layer only knows about the layer directly below it.
+Q: If switching from OpenAI to Anthropic, which file(s) need to change? A: Only clients/llm.py. The route and service stay completely untouched. This is the real payoff of layering: a change to how something is done stays contained in one small file instead of rippling through the codebase.
+Dependency Injection
+Q: Why doesn't QAService just create its own LLMClient() directly inside __init__?
+Option A — creating it directly (bad):
+class QAService:
+    def __init__(self):
+        self.llm_client = LLMClient()   # hardwired
+Option B — receiving it from outside (dependency injection):
+class QAService:
+    def __init__(self, llm_client):
+        self.llm_client = llm_client    # handed in
+In Option A, QAService is permanently glued to one specific class — there's no way to swap in a fake for testing. In Option B, QAService just says "give me something with a .complete() method" — whoever builds the service (real app, or a test) decides what to hand in.
+Analogy: a chef who insists on growing their own vegetables is stuck farming every time. A chef who just says "give me vegetables" gets real ones on a normal day, and plastic ones from a trainer on a practice day — they cook the same way either time.
+fake_client = FakeLLMClient()
+service = QAService(llm_client=fake_client)
+The service code itself never changes — only what gets handed in changes.
+Q: Why would testing with Option A be slow or unreliable? A: Every test using QAService would call the real LLMClient(), meaning real network calls:
+1. Slow — real calls take hundreds of ms to seconds; a 20-test suite could take minutes.
+2. Costly — every test run burns real API credits.
+3. Unreliable — real APIs can be down, rate-limited, or return different wording each time, so tests can fail for reasons unrelated to actual bugs.
+Q: Why does FakeLLMClient make tests fast and reliable? A:
+• Fast — FakeLLMClient.complete() doesn't go over the network; it returns a hardcoded string in microseconds.
+• Reliable — the output never changes; it always returns exactly "fake answer", no randomness.
+def test_ask_returns_llm_answer():
+    fake_client = FakeLLMClient()
+    service = QAService(llm_client=fake_client)
+    response = await service.answer_question("some question")
+    assert response.answer == "fake answer"
+This test isn't checking "does the LLM give good answers" — it's checking "does QAService correctly take whatever the client returns and put it into the response." With the real client, the test would be slower, cost money, and couldn't even assert an exact string since real output varies.
+Topic 3: Async Python
+The problem this solves
+Q: What happens while your server waits for a slow thing, like a 2-second LLM API call? A: Without async, the server sits completely idle during those 2 seconds. Other incoming requests have to wait in line even though the server isn't actually computing anything — it's just stuck waiting.
+The key idea
+Async lets your program say "I'm waiting on something slow, go do other useful work, and come back to me when it's ready." It's about using waiting time productively, not doing multiple things at the exact same instant.
+Analogy: a bad chef stares at boiling water for 5 minutes doing nothing else. A good chef chops vegetables for the next dish while the water boils, then returns the moment it's ready. The chef isn't doing two things in the same millisecond — just never idly staring when there's useful work elsewhere.
+Q: Does async use multiple CPU cores for true parallel computation? A: No. Async does not use multiple CPU cores — it's a single-threaded trick where the program switches to other waiting tasks during idle time, not true parallel computation. It's not multiple processes running, it's a single process switching between multiple waiting tasks.
+The event loop
+The event loop is the single thing that keeps track of all tasks currently waiting on something (like a network call). When a task is waiting, the event loop sets it aside and checks if another task is ready to continue. The moment the LLM API responds, the event loop picks that task back up exactly where it left off.
+Q: Does the event loop help with heavy CPU computation (e.g., crunching numbers for 5 seconds), or only with waiting on external things? A: Only with waiting (I/O-bound). It does not help with CPU-bound work.
+I/O-bound waiting — the CPU is idle, waiting for something outside itself (network request, database query, file read). Async helps here. CPU-bound work — the CPU itself is busy (crunching numbers, running a loop). Async does not help here — there's no idle gap to hand off.
+Reason: await only hands control back to the event loop at points where code is waiting on something external. A tight CPU loop has no natural pause point — the CPU is busy the entire time.
+Chef analogy extended: waiting for water to boil is I/O — the chef can go chop vegetables. Physically kneading dough non-stop for 5 minutes is CPU-bound — hands are occupied the whole time, no amount of clever scheduling frees them up.
+Q: Which benefits from async/await — calling the LLM API, or summing 10 million numbers in a loop? A: Calling the LLM API benefits (I/O-bound, CPU is idle while waiting). Summing 10 million numbers does not — it's CPU-bound, continuously busy, no idle gap to exploit.
+async / await in code
+async def get_llm_answer(question: str) -> str:
+    response = await llm_client.complete(question)
+    return response
+async def marks a function as one that can pause and let other tasks run while it waits. await is the actual pause point — "this line is where I might be waiting, hand control back to the event loop until it's ready."
+Rule: You can only use await inside a function defined with async def, and only in front of something that is itself async.
+Q: If llm_client.complete() was a normal def (not async def), would await llm_client.complete(question) work? A: No — it would cause a TypeError, because await can only be used on an "awaitable," and a normal function doesn't produce one; it just runs immediately and returns a normal value. await doesn't make any function pause-able — only async def functions can pause and resume.
+The classic mistake — blocking the event loop
+If an async def route accidentally calls a regular blocking function (an old-style library without async support, or time.sleep(2) instead of the async version), that one blocking line freezes the entire event loop for its duration. No other request can be handled — the exact problem async was supposed to solve, right back again.
+Q: Why is time.sleep(2) dangerous inside async def, but await asyncio.sleep(2) is fine? A: time.sleep(2) blocks the entire event loop for 2 seconds — nothing else can run, because it's a plain synchronous call with no awareness of the event loop. await asyncio.sleep(2) tells the event loop "I'm pausing here, go run other waiting tasks," and resumes this function right after once the time is up.
+Rule: Inside async def functions, always use the async version of a waiting operation — asyncio.sleep not time.sleep, an async DB driver not a blocking one, httpx's async client not requests.
+Topic 4: Error Handling and Middleware
+Why we need this layer
+Q: What happens if the LLM API call fails or your code hits a bug, with no special handling? A: An unhandled error crashes the request with a raw, ugly error — often leaking internal details like file paths or stack traces, with no useful information for the client.
+Exception handlers
+class LLMError(Exception):
+    pass
+
+@app.exception_handler(LLMError)
+def handle_llm_error(request, exc):
+    return JSONResponse(status_code=502, content={"error": "LLM service unavailable"})
+This says: whenever any code anywhere raises an LLMError, don't crash — catch it here and return this clean, controlled response instead. The route doesn't need its own try/except — FastAPI catches it globally.
+Business logic in the service can just raise LLMError("...") without worrying about response formatting — the handler, defined once, formats it everywhere.
+Status codes
+Q: Why 502 specifically, rather than 500 or 404? A: 502 Bad Gateway specifically means: "I'm fine, but I depend on another server (the LLM provider's API), and they failed or returned garbage."
+Code
+Meaning
+Whose "fault"
+400
+Bad request
+Client sent malformed data
+422
+Validation error
+Client's data didn't match the Pydantic schema
+404
+Not found
+Client asked for something that doesn't exist
+500
+Internal server error
+Bug in your own server code
+502
+Bad gateway
+A service you depend on (e.g. the LLM) failed
+Q: If your own code has a bug (e.g. a KeyError from a typo), what status code should that produce? A: 500, not 400. 400 Bad Request means the client sent malformed data. 500 means the server has a bug, unrelated to what the client sent.
+Test to apply: "If the client had sent a perfectly valid request, would this error still have happened?" If yes → bug in your code → 500. If the error only happens because of bad client input → 400 (or 422 for Pydantic validation failures).
+Middleware
+Middleware is code that runs around every single request — before it reaches your route, and again after the route sends back a response — without adding that code to every route individually.
+Analogy: airport security. Every passenger, regardless of flight or gate, passes through the same checkpoint first, doing its one job for everyone before they continue to their actual gate.
+@app.middleware("http")
+async def log_requests(request, call_next):
+    print(f"Incoming: {request.method} {request.url}")
+    response = await call_next(request)
+    print(f"Outgoing: {response.status_code}")
+    return response
+Everything before call_next(request) runs on the way in, before the route executes. call_next(request) is the moment the route actually runs. Everything after runs on the way out, after the route is done, before the response reaches the client.
+Q: With two stacked middlewares (logging, then request-ID), what order do "before" and "after" run in? A: "Before" code runs outer-to-inner, in registration order: logging's before, then request-ID's before. "After" code runs the reverse: inner-to-outer — request-ID's after code first, then logging's after code last.
+Onion analogy: logging is the outer skin, request-ID is the inner layer, the route is the core. Going in, you peel outer then inner to reach the core. Coming back out, you pass inner first, then outer, to exit. Whichever layer you entered last is the one you exit first.
+Topic 5: pytest
+What pytest is, in plain words
+pytest is a tool that runs little pieces of Python code you write, called "tests," and tells you which ones passed and which failed. Running things by hand every time you change a line of code is slow and error-prone; a test checks automatically, every time, in under a second.
+The simplest possible test
+def add(a, b):
+    return a + b
+
+def test_add():
+    assert add(2, 3) == 5
+• add is just an ordinary function.
+• test_add() is a test — the only special thing is its name starts with test_, which is how pytest recognizes it as something to run.
+• assert is a Python keyword meaning "I am claiming this is true." If true, nothing happens, the test passes. If false, Python raises an error, and pytest reports "this test failed."
+Q: What does assert do? A: It checks whether a claim about the code is true or false. If true, nothing happens and the test passes. If false, it fails and pytest reports it.
+Running tests
+Save the code in a file whose name starts with test_ (e.g. test_math.py). In the terminal, in that folder, run:
+pytest
+pytest automatically finds files starting with test_, finds functions inside them starting with test_, and runs every one. You never call test_add() yourself.
+Passing output looks like:
+test_math.py .                                                    [100%]
+1 passed in 0.01s
+Failing output looks like:
+test_math.py F                                                    [100%]
+
+    def test_add():
+>       assert add(2, 3) == 5
+E       assert 6 == 5
+
+1 failed in 0.01s
+F means failed (vs . for passed). The line assert 6 == 5 shows the actual value (6) versus the expected value (5) — no print statements needed.
+Q: If a file is named check_math.py instead of test_math.py, would pytest find test_add() inside it? A: No — pytest only looks inside files whose names start with test_ or end with _test.py. check_math.py matches neither pattern, so pytest skips it entirely, even if the function inside is named correctly. Both the filename and the function name must follow the naming convention — miss either, and pytest silently ignores it.
+Fixtures — avoiding repeated setup
+The repetition problem:
+def test_answer_question_one():
+    fake_client = FakeLLMClient()
+    service = QAService(llm_client=fake_client)
+    response = service.answer_question("hi")
+    assert response.answer == "fake answer"
+
+def test_answer_question_two():
+    fake_client = FakeLLMClient()
+    service = QAService(llm_client=fake_client)
+    response = service.answer_question("bye")
+    assert response.answer == "fake answer"
+The first two lines inside both tests are identical — repeated setup. If QAService needs a third argument tomorrow, you'd have to fix it everywhere it's copy-pasted.
+Pulling setup into a fixture:
+import pytest
+
+@pytest.fixture
+def qa_service():
+    fake_client = FakeLLMClient()
+    return QAService(llm_client=fake_client)
+@pytest.fixture tells pytest: "don't treat this function as a test — treat it as reusable setup code that other tests are allowed to request." You never call qa_service() yourself — you put its exact name as a parameter in a test function, and pytest automatically runs it and hands you back what it returned.
+def test_answer_question(qa_service):
+    response = qa_service.answer_question("hi")
+    assert response.answer == "fake answer"
+qa_service inside the parentheses is a request, not a value the test creates. pytest sees the test needs something called qa_service, finds the fixture with that exact name, runs it, and hands the test whatever it returned. The name must match exactly — that's the only thing connecting a test to its fixture.
+Q: If the parameter were renamed from qa_service to service (fixture left as qa_service), would it still work? A: No. pytest connects a test to a fixture purely by matching the parameter name to the fixture's function name, exactly. A mismatched name means pytest can't find the fixture, and the test fails with an error.
+Q: Does a second test using the same fixture get the same instance, or a fresh one? A: A fresh, newly-created instance — by default, pytest creates a brand-new instance of the fixture for every single test that uses it. This is called test isolation: changes in one test's fixture instance can never leak into another test. This is why tests can run in any order, or in parallel, without interfering with each other. (To deliberately share one instance across tests, use @pytest.fixture(scope="module") or scope="session" — the default scope="function" means fresh-per-test.)
+@pytest.mark.parametrize — testing many cases without repeating code
+The repetition problem, again:
+def test_valid_question():
+    question = "How do I reset my password?"
+    assert len(question.strip()) >= 3
+
+def test_empty_question():
+    question = ""
+    assert not (len(question.strip()) >= 3)
+
+def test_blank_question():
+    question = "   "
+    assert not (len(question.strip()) >= 3)
+All three tests check the exact same logic — only the input and expected result differ. Three near-identical copy-pasted blocks for one idea tested three times.
+Using parametrize:
+import pytest
+
+@pytest.mark.parametrize("question,expected_valid", [
+    ("How do I reset my password?", True),
+    ("", False),
+    ("   ", False),
+])
+def test_question_validation(question, expected_valid):
+    is_valid = len(question.strip()) >= 3
+    assert is_valid == expected_valid
+@pytest.mark.parametrize("question,expected_valid", [...]) has two parts: a string naming the parameters, and a list of tuples providing one set of actual values per test run. pytest runs test_question_validation once per tuple:
+• Run 1: question = "How do I reset my password?", expected_valid = True
+• Run 2: question = "", expected_valid = False
+• Run 3: question = "   ", expected_valid = False
+Three separate test runs, reported individually as pass/fail, from one function body written once.
+Both "" and "   " map to False for the same reason we saw with the not_blank validator in Topic 1: .strip() removes whitespace from both ends, so "".strip() and "   ".strip() both become "", which has a length of 0, less than 3 — so both correctly fail validation, even though three spaces technically has "length 3" before stripping.
+(This session paused here — pick back up with pytest.raises for testing exceptions, async test support via pytest-asyncio, and dependency-override patterns for testing FastAPI routes directly.)
+Quick Self-Check
+Before moving on, you should be able to answer all of these out loud, without looking:
+1. What's the difference between a GET and a POST request, and why does POST use a body?
+2. Why does Pydantic convert 123 to "123" but reject a null for a required string field?
+3. What's the difference between a Field constraint and a custom @field_validator?
+4. Why does response_model strip extra fields from a response?
+5. What are the three layers in the architecture, and what does each one know about the others?
+6. Why is dependency injection necessary for fast, reliable tests?
+7. What's the difference between I/O-bound and CPU-bound work, and why does async only help one of them?
+8. Why is time.sleep() dangerous inside an async def function?
+9. What's the difference between a 400, 422, 404, 500, and 502 status code?
+10. In stacked middleware, why does the "after" order reverse relative to the "before" order?
+11. What naming rules does pytest require for files and functions?
+12. How does a fixture get connected to a test that uses it?
+13. Why does each test get a fresh fixture instance by default?
+14. What problem does @pytest.mark.parametrize solve?
+End of Week 1 pen-and-paper review. Next up when ready: finishing pytest (pytest.raises, async tests, dependency overrides), then a full end-to-end request trace tying all five topics together.
