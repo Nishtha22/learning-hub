@@ -1,5 +1,5 @@
 Week 2 Review — LLM Fundamentals & APIs (Q&A Style)
-Oct 20, 2026 · @Nishtha
+
 This is a compiled revision document from a pen-and-paper style Q&A review session covering Week 2 of the AI engineering roadmap: LLM fundamentals, LLM APIs, streaming architecture, prompt engineering, model selection, and the Week 2 project.
 Topic 1: LLM Fundamentals
 Why sub-word tokens instead of whole words? A fixed whole-word vocabulary can never be complete — it would need to be enormous to cover every word, name, typo, and slang term, and would still miss things. Sub-word tokenization solves this with a much smaller vocabulary (often 30,000-50,000 pieces) that can represent any string, because worst case it falls back to spelling things out letter by letter. A made-up word like "zorbling" isn't a problem — it just gets split into recognizable fragments (e.g. "zorb" + "ling").
