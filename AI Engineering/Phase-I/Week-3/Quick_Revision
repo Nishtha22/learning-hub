@@ -1,0 +1,197 @@
+Week 3 Review — Production RAG (Q&A Style)
+
+A compiled revision document from the Week 3 Q&A session on production RAG: ingestion, chunking, retrieval, vector databases, and the project.
+Topic 1: Document Ingestion
+The pipeline: Documents → Parsing → Cleaning → Metadata → Chunking → Embedding → Vector DB.
+Parsing comes before cleaning. A file is a format, not just text. Parsing understands the container (PDF, HTML, Markdown) and extracts the content. Only then can cleaning remove the noise left in the extracted text.
+Cleaning. Removes repeated headers and footers, page numbers, broken mid-sentence line breaks, and leftover artifacts like bullet symbols or table borders. Skip it and that junk gets embedded too, which dilutes each chunk's meaning and hurts retrieval.
+Metadata. Source, page number, author, dates, document ID and version. It powers citations and filtering later, for example "only this document" or "only the latest version".
+PDFs are the hardest. A PDF stores characters at coordinates on a page, not paragraphs, so the parser has to guess reading order.
+• Two-column layouts read straight across produce sentences stitched from unrelated paragraphs. Fix: a layout-aware parser that reads each column top to bottom.
+• Scanned PDFs are images, so they need OCR to get any text.
+• Tables flattened into plain text lose the link between a value and its row and column headers ("Q1 450 Q2 520 North South" is ambiguous). Fix: extract tables separately and convert them to Markdown or to sentences like "North region, Q1 sales: 450".
+HTML and Markdown already mark headings, lists and tables explicitly, so structure is read directly instead of guessed. It also pays off in chunking, since you can split at heading boundaries and keep the section title as metadata. For HTML, cleaning means stripping navigation menus, ads, scripts and footers.
+Document versioning. If a policy changes and old chunks stay in the database, the system confidently answers from the old version, or mixes old and new into one contradictory answer. Each chunk carries a document ID, version, and last-updated date. On change, either delete the old chunks and insert new ones, or mark old ones inactive and filter them out at query time.
+Detecting changes cheaply. A periodic job computes a content hash (a fingerprint) per document and compares it with the hash stored in metadata. Same hash: skip. Different hash: re-parse, re-chunk, re-embed, replace. Only changed documents get reprocessed, which saves embedding cost.
+import hashlib
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def needs_reingest(doc_id: str, new_text: str, stored_hashes: dict) -> bool:
+    return stored_hashes.get(doc_id) != content_hash(new_text)
+
+Topic 2: Chunking
+Why chunk at all. One vector can't capture the meaning of a 200-page document, and the whole thing wouldn't fit in the LLM's context anyway. So documents are split into pieces that are embedded and retrieved individually.
+Strategy
+How it splits
+Use when
+Cost or catch
+Fixed-size
+Every N tokens (e.g. 500) with overlap (e.g. 50)
+Baseline, prototypes, uniform or messy text
+Cuts blindly, can slice an idea in half
+Recursive
+Paragraph, then sentence, then word, only as needed
+Default for structured text: manuals, policies, articles
+Almost none
+Semantic
+Cuts where meaning shifts between neighbouring sentences
+Transcripts, chat logs, rambling text with no headings
+Embeds every sentence, uneven chunk sizes
+Parent-child
+Search small child chunks, return the larger parent
+Long reports, legal docs, specs where answers need context
+More chunks to store and embed
+Fixed-size and overlap. If a cut lands mid-sentence, chunk one ends with half a thought and chunk two starts with the other half, so neither carries the full meaning. Overlap repeats the last 50 tokens of chunk one at the start of chunk two, so a sentence near the boundary appears whole in at least one chunk. The cost is some duplicated tokens.
+Recursive. A paragraph usually holds one complete idea, so keep paragraphs intact. Only if a paragraph exceeds the size limit does it drop to sentences, and only if a sentence is too big does it split on words. It cuts hard only as a last resort.
+Semantic. Embed each sentence, compare neighbours with cosine similarity, and cut where similarity drops sharply. Keywords are a weaker signal, since two sentences can mean the same thing with different words. It is worth the cost only when topics shift often and structure is missing. (Not to be confused with document-aware chunking, which splits using a document's own headings.)
+Parent-child. Small chunks give sharp embeddings that match questions accurately. Big chunks give the LLM enough context to answer fully. Parent-child gets both: search small, return big. Note it doesn't make search cheaper, since there are more chunks overall. The win is precision.
+Rule of thumb. Start with recursive, measure retrieval quality, and move to something fancier only when you can show it helps.
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", ". ", " ", ""],  # paragraph, line, sentence, word, char
+)
+chunks = splitter.split_text(cleaned_text)
+The sizes above are in characters by default. To count tokens instead, use the splitter's tiktoken-based constructor. Verify the import path against the current LangChain docs before running.
+
+Topic 3: Retrieval
+The full architecture: Query → Query transformation → Hybrid retrieval (BM25 + vector search, with a metadata pre-filter) → Merge (RRF) → Reranker → Top K → LLM.
+Dense vs. sparse. Dense retrieval embeds the query and chunks and finds the closest in meaning. Sparse retrieval (BM25) matches the actual words, scoring by how often and how rarely the query's terms appear.
+• "ERR-4021" has no semantic meaning for an embedding model, so dense may return generic error chunks. BM25 matches the exact token. Sparse wins.
+• "How do I get my money back?" vs. a document saying "refund policy" shares no words, but the embeddings land close. Dense wins.
+• Each method covers the other's blind spot, which is the whole case for hybrid.
+Merging with Reciprocal Rank Fusion (RRF). You can't add raw scores: BM25 is unbounded (12, 30) while cosine similarity sits around 0.3 to 0.9, so BM25 would swamp the sum. RRF ignores raw scores and uses only rank positions. For each list a chunk appears in, it earns 1 / (60 + rank). Add those up across lists. The 60 is a smoothing constant.
+Example: chunk A is rank 1 in BM25 and rank 3 in vector search, so 1/61 + 1/63 ≈ 0.0323. Chunk B is rank 2 in BM25 and missing from vector, so 1/62 ≈ 0.0161. A wins because it ranks well in both lists.
+def rrf(ranked_lists: list[list[str]], k: int = 60) -> list[str]:
+    scores: dict[str, float] = {}
+    for ranking in ranked_lists:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+merged = rrf([bm25_ids, vector_ids])
+Metadata filtering: before, not after. Pre-filter so you search a smaller pool and rank within it. Post-filtering can leave you with zero results, because the top 5 may all be from old versions while good current chunks sat further down. Typical filters: document version, source, department, date range, and user permissions (never show one customer's documents to another).
+Query rewriting. A vague query like "it's not working, what do I do?" gives a vague embedding and gives BM25 almost nothing to match. An LLM rewrites it using chat context, expands abbreviations, fixes typos, and adds likely keywords. "What about the premium plan?" becomes "What is the refund policy for the premium plan?".
+Multi-query retrieval. The LLM generates several phrasings (e.g. "cancel subscription", "terminate account", "stop billing") and you retrieve for each, then merge with RRF. This improves coverage, since the documents may phrase the answer in a way one rewrite never guessed. Cost: an extra LLM call and several retrievals.
+Reranking. First-stage retrieval embeds query and chunk separately, so they never see each other. A cross-encoder reads the query and chunk together and scores relevance more accurately. It runs once per candidate, so it is too slow for millions of chunks. Hence two stages: cheap retrieval narrows to about 20, the reranker picks the best 5.
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+pairs = [(query, chunk.text) for chunk in candidates]
+scores = reranker.predict(pairs)
+top_k = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)][:5]
+Contextual compression. Even the best chunks hold filler. Compression trims each chunk to the relevant parts, via an LLM extracting key sentences or by filtering low-scoring sentences. It saves tokens, leaves room for more chunks, and reduces noise. Trade-off: possibly an extra LLM call, and a risk of cutting something important. Add it when context is genuinely bloated.
+Cutting latency. Drop the extra LLM calls first: keep a single query rewrite instead of multi-query, and skip compression. Keep the reranker (biggest quality gain per millisecond) and the hybrid retrieval itself.
+Topic 4: Vector Databases
+The plan: stay lean. You know FAISS and Chroma. Add PostgreSQL + pgvector first, then learn one production vector DB later.
+What FAISS and Chroma lack in production. FAISS is a library and a bare index, not a database. It can save an index to disk, but there is no easy update or delete handling, no metadata filtering, no access control, no backups. Chroma has storage and filtering but is built for simplicity and small to mid-sized setups, not the scale, reliability and operational tooling production needs.
+Why pgvector. An extension that adds a vector column type and similarity search to PostgreSQL. Vectors live beside your users, documents and permissions tables, so you get:
+• One database to run, back up and secure.
+• Metadata filtering in plain SQL, in the same query as the vector search.
+• Permission checks via joins against your users table.
+• Transactions: deleting old chunks and inserting new ones is atomic.
+Note: pgvector is dense only. For BM25-style keyword search in Postgres, use its built-in full-text search and merge the two result lists yourself (RRF).
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+    id           BIGSERIAL PRIMARY KEY,
+    doc_id       TEXT NOT NULL,
+    version      INT NOT NULL,
+    is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+    page         INT,
+    content      TEXT NOT NULL,
+    embedding    vector(1536)   -- dimension must match your embedding model
+);
+
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Pre-filtered similarity search (<=> is cosine distance)
+SELECT id, content
+FROM chunks
+WHERE is_active = TRUE AND doc_id = $1
+ORDER BY embedding <=> $2
+LIMIT 20;
+Approximate nearest neighbour (ANN). Brute force compares the query to every vector: exact but slow at millions of vectors. ANN builds a structure in advance so a query checks only a promising region. Trade-off: a small loss of accuracy for a big gain in speed. For RAG that is fine, since you retrieve about 20 candidates and rerank anyway.
+IVFFlat: sorting into piles. At build time, vectors are clustered into groups, each with a centre. At query time, compare the query to the centres, pick the nearest few clusters, and search only inside them. Lighter and faster to build, but recall is usually lower, because the true nearest vector may sit in a cluster you skipped (the boundary problem). It needs data in the table before you build the index, since it must see the vectors to form the clusters.
+HNSW: a layered road map. A graph where each vector links to its nearest neighbours, with sparse upper layers holding long-distance links. A query starts at the top, hops toward the right area, drops a layer, refines, and finishes by walking between close neighbours on the bottom layer. Best speed and recall, but more memory and slower to build. Usual default.
+Both are approximate. Only brute force is exact.
+Beyond pgvector. Teams outgrow it on scale and operations, not because Postgres lacks cloud hosting (RDS, Aurora, Cloud SQL, Supabase and Neon mostly support pgvector). At hundreds of millions of vectors, HNSW indexes want RAM and builds get slow, and heavy vector traffic can compete with normal application queries.
+Option
+Use when
+FAISS
+Experiments and offline work, raw speed, no database needed
+Chroma
+Prototypes and small projects
+pgvector
+Default for real apps already on Postgres, up to a few million vectors
+Pinecone
+Fully managed, zero operations, happy to pay
+Weaviate
+Open source, vector-first, built-in hybrid search
+OpenSearch
+Heavy keyword search, or already on AWS; BM25 core plus vector support
+Elasticsearch
+Same family as OpenSearch (OpenSearch was forked from it in 2021 after a licensing dispute); backed by Elastic and its cloud
+My pick for the later production DB: Weaviate, for built-in hybrid search.
+Topic 5: Week 3 Project — Production RAG API
+Query path: User → FastAPI → Retrieval (BM25 + vector search in parallel) → Reranker → LLM → Answer with citations.
+Layering, same pattern as Weeks 1 and 2.
+• Routes stay thin: HTTP request and response only.
+• rag_service sits on top: calls retrieval, builds the prompt, calls the LLM, returns the answer with citations from chunk metadata.
+• retrieval_service holds the decisions: query rewriting, running BM25 and vector search, merging with RRF, reranking, and metadata pre-filtering.
+• Clients do raw mechanics only: the database query, the embedding call, the LLM API call.
+Ingestion is a separate module, not part of the query request. Parsing, chunking and embedding a large PDF can take seconds or minutes, so it must not block or time out a request. It can also fail and need retries without breaking the upload. Documents also change over time and need re-ingestion.
+Shape: an upload endpoint saves the file and records it in a table with status pending. A background worker or scheduled job picks it up, runs parse, clean, metadata, chunk, embed, store, then sets the status to done or failed. The same worker runs the content-hash check for changed documents. The query path and the ingestion path share only the database.
+# routes/rag.py
+@router.post("/ask")
+async def ask(req: AskRequest):
+    return await rag_service.answer(req.question, filters=req.filters)
+
+# services/rag_service.py
+async def answer(question: str, filters: dict):
+    chunks = await retrieval_service.retrieve(question, filters)  # rewrite, hybrid, RRF, rerank
+    prompt = build_prompt("rag_answer", question=question, chunks=chunks)
+    response = await llm_client.call(prompt=prompt)
+    return {"answer": response.text, "sources": [c.metadata for c in chunks]}
+
+# services/retrieval_service.py
+async def retrieve(question: str, filters: dict, top_k: int = 5):
+    query = await rewrite_query(question)
+    bm25_ids = await db_client.bm25_search(query, filters, limit=20)
+    vector_ids = await db_client.vector_search(query, filters, limit=20)
+    merged = rrf([bm25_ids, vector_ids])
+    return rerank(query, await db_client.fetch_chunks(merged[:20]))[:top_k]
+Outcome question: "Why did you choose this chunking strategy and retrieval architecture?"
+
+A polished answer ties each choice to a reason:
+1. Chunking: recursive, because the documents are structured policies with clear paragraphs, so it keeps each idea intact at almost no extra cost. Parent-child would be the next step if answers needed more surrounding context.
+2. Hybrid retrieval: BM25 catches exact terms like error codes and names, dense search catches paraphrases and meaning. Each covers the other's blind spot.
+3. RRF to merge: raw BM25 and cosine scores live on different scales, so merge by rank position instead.
+4. Cross-encoder reranking: it reads the query and chunk together, so it judges relevance more accurately than first-stage search, and running it on only about 20 candidates keeps the speed cost small.
+5. Metadata pre-filtering: only current document versions, and only what the user is permitted to see, get searched.
+6. pgvector: SQL filtering, permission joins and transactions in the database already in use.
+
+Quick Self-Check
+1. Why does parsing come before cleaning, and what goes wrong if you skip cleaning before embedding?
+2. What goes wrong when a parser reads a two-column PDF straight across, and when a table is flattened to plain text?
+3. How do you detect that a document changed without re-embedding everything?
+4. What is the overlap in fixed-size chunking protecting against?
+5. Why does recursive chunking try paragraphs first?
+6. How does semantic chunking decide where to cut, and when is its cost worth paying?
+7. Why does parent-child search small but return big? Does it make search cheaper?
+8. Which retrieval method wins for "ERR-4021", and which for "how do I get my money back?"
+9. Why can't you add BM25 and cosine scores directly? What does RRF use instead, and what is its formula?
+10. Why pre-filter on metadata instead of post-filtering?
+11. What is the difference between query rewriting and multi-query retrieval, and what does multi-query cost?
+12. Why is a cross-encoder more accurate than first-stage retrieval, and why not run it on every chunk?
+13. What does contextual compression do, and when would you skip it?
+14. Which pipeline steps would you drop first to cut latency?
+15. What are FAISS and Chroma missing for production, and what does pgvector add?
+16. Is pgvector sparse, dense, or both? How would you get BM25-style search in Postgres?
+17. Explain IVFFlat and HNSW in one sentence each. Which is exact?
+18. Why should ingestion be a separate background module and not run inside the upload request?
+19. Give a full answer to "Why did you choose this chunking strategy and retrieval architecture?"
