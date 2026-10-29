@@ -1,0 +1,203 @@
+Week 4 Review — RAG Evaluation, Observability & Caching (Q&A Style)
+
+A compiled revision document from the Week 4 Q&A session: evaluating RAG, tracing and monitoring it, caching it, and debugging it when it gets worse.
+
+Topic 1: RAG Evaluation — Retrieval Metrics
+The week's pipeline: RAG → Evaluation → Tracing → Monitoring → Optimization. Many candidates stop at "RAG → answer". The skill is knowing when it is wrong, where, and why.
+Two halves, two kinds of failure. A RAG system has a retrieval stage (did we find the right chunks?) and a generation stage (given those chunks, did the LLM write a good, faithful answer?). Checking only the final answer can't tell you which stage broke, so evaluation has separate metrics for each.
+Example: the user asks about the refund window and the system says 14 days, but the policy says 30. Possible causes:
+• Retrieval: a stale old chunk saying 14 days was retrieved, the right chunk ranked too low or was missed, or bad chunking separated "30 days" from the word "refund".
+• Generation: the right chunk was retrieved, but the model hallucinated or ignored the context.
+Context precision. Of the chunks retrieved, how many were actually relevant? If 2 of 5 retrieved chunks are useful, precision is 2/5 = 40%. Low precision means junk in the context.
+Context recall. Of all the information needed to answer, how much did we actually retrieve? If the answer needs three facts and the top 5 chunks hold only two, recall is low. Low recall means something important never reached the LLM.
+Retrieval relevance. A more general score of how well the retrieved chunks match the question, often judged by an LLM. Precision and recall are more specific about which chunks were useful.
+Memory aid (librarian): precision asks whether the pile she handed you is clean. Recall asks whether she found everything you needed.
+The trade-off. Retrieving 20 chunks instead of 5 casts a wider net: recall goes up (more likely to catch the needed fact), but precision goes down (more junk). A bigger net catches more fish, and more old boots.
+The reranker resolves it. First-stage retrieval casts the wide net (high recall), then the cross-encoder reranks and you keep only the best few (precision back up). The reranker only reorders what it is given, so it cannot fix low recall. If the needed chunk never made the shortlist, nothing downstream can conjure it.
+Debugging rule of thumb:
+• Low recall: fix first-stage retrieval. Retrieve more candidates, add hybrid search, rewrite the query, or fix the chunking.
+• Low precision: fix the reranker or reduce the number of chunks you keep.
+
+Topic 2: Generation and Operational Metrics
+Faithfulness. Is every claim in the answer supported by the retrieved chunks? If the model adds something the chunks never said, faithfulness drops. In RAG, this failure is essentially what hallucination means: the model makes something up, or ignores the context and leans on its own training knowledge.
+Answer relevance. Does the answer actually address the question the user asked? Faithfulness and relevance are independent:
+• User asks "What's the refund window?" and the model gives an accurate, fully supported paragraph about the cancellation process. Faithfulness is high, answer relevance is low (grounded but off-topic).
+• You need both. One catches made-up answers, the other catches off-topic ones.
+Hallucination. The failure itself: claims not grounded in the retrieved context. Faithfulness is the metric that measures it.
+Reading the metrics together (diagnosis table).
+What moved
+Stage to suspect
+Recall down
+First-stage retrieval, chunking, embeddings, query rewriting
+Precision down
+Reranker, number of chunks kept, junk in the database
+Faithfulness down (retrieval metrics fine)
+Generation: prompt, model version
+Answer relevance down
+Generation: prompt drifting from the question
+Operational metrics. Latency, token usage, cost, error rate.
+Cost follows tokens. If cost doubles overnight with no code change, look for anything that inflates tokens sent to the LLM:
+• Ingestion produced bigger or messier chunks, so each prompt carries more text.
+• More chunks being retrieved per query.
+• Users sending longer questions.
+• A retry loop silently repeating calls after errors (which is why error rate sits next to cost).
+• The provider changing pricing or the model version.
+Track tokens per request and cost per request over time to see exactly when the jump happened.
+Latency needs per-stage timing. A single total can't say whether rewriting, retrieval, reranking, or the LLM call is slow. Tracing gives each step its own timed span.
+Averages hide the worst cases. If 95 requests take 1 second and 5 take 30, the average looks fine while some users suffer. Use percentiles:
+• p95 = 20 seconds means 95% of requests finished in 20 seconds or less, so the slowest 5% took longer.
+• A 2-second average with a 20-second p95 means most users are happy but roughly 1 in 20 waits 20 seconds or more. That is a real problem the average hides, and those users may give up or retry, adding load.
+• Watch p95 and p99, not just the mean.
+
+Topic 3: Evaluation Tooling — LangSmith, Ragas, DeepEval
+The vocabulary.
+Term
+What it is
+Exam analogy
+Run
+One timed step (a rewrite, a retrieval, an LLM call)
+One answer on the paper
+Trace
+The full record of one request: a tree of runs
+One student's complete answer sheet
+Dataset
+A saved set of test questions, usually with ideal answers
+The exam paper
+Experiment
+One run of your RAG system over the whole dataset
+One sitting of the exam
+Evaluator
+A grader that scores each answer (simple code or LLM-as-judge)
+The marker
+The workflow, with one running example. You changed chunk size from 500 to 800 and want to know if the system improved.
+1. Dataset: write about 50 realistic questions with ideal answers ("What's the refund window?" with "30 days"). Store them in LangSmith.
+2. Experiment: LangSmith runs every question through your RAG system, recording a trace per question. The batch of results is the experiment.
+3. Scoring: evaluators grade each answer. Some are plain code (does "30" appear in the answer?). Others are LLM-as-judge, scoring things like faithfulness.
+4. Comparing: repeat with the old chunk size and view both experiments side by side. For example, faithfulness 0.82 to 0.88, but latency rose. Now you have evidence.
+Why not just try a few questions by hand? A handful of hand-picked questions covers few scenarios and can mislead. A fixed dataset gives the same questions and same scoring each time, so the only variable is your change.
+Traces vs experiments (common mix-up). A trace explains what happened inside one request, so it is for debugging. An experiment compares versions across the whole dataset. A user complains about one bad answer: open the trace. You want to know if a new prompt is better overall: run an experiment over the dataset (the dataset alone does not answer it).
+Finding what got worse. If faithfulness drops from 0.88 to 0.70:
+1. Open the experiment and compare the two runs row by row, or sort by faithfulness, so the questions that dropped most rise to the top.
+2. Open the trace for one of them. Did retrieval bring back the right chunks? If yes, generation is at fault (prompt, model). If the right chunk is missing, look upstream at chunking and retrieval.
+LLM-as-judge. A second model gets the question, the retrieved chunks and the answer, and scores it. For faithfulness it typically splits the answer into individual claims and checks each against the chunks. Ragas and DeepEval are libraries that give you these judges ready-made, so you don't write the judging prompts yourself. They work on records of question, retrieved contexts and answer, from a dataset, a test script, or exported trace data. They do not need traces.
+Can you trust a score of 0.95? Check two things: is the dataset big and realistic enough (ten questions can be luck, and questions should resemble real user questions), and does the judge match human judgement? The judge is an LLM, so it can be wrong or biased. Spot-check by reading a sample of answers yourself and seeing whether you agree with the scores.
+LangSmith: open source or not? Not open source. It is proprietary SaaS, and self-hosting is only on the Enterprise plan. But the hosted Developer tier is free and includes about 5,000 traces per month, which is plenty for learning and for the Week 4 project. You create an account, set an API key as an environment variable, and add a tracing hook to your code. Every request then appears as a trace in the web dashboard, where you upload datasets, run experiments and attach evaluators. It works with plain Python and FastAPI, though it fits best with LangChain or LangGraph. (Pricing changes often, so check the current page.)
+Alternatives. Langfuse and Arize Phoenix are open source and free to self-host, covering similar ground. Galileo is a comparable commercial platform, with comparisons often citing it as strong on RAG evaluation and groundedness. Several of those comparisons come from vendors, so treat them as opinions. The concepts transfer directly between tools.
+Prompt testing. Same workflow: run the old and new prompt over the same dataset, score both with the same evaluators, and compare the experiments before shipping the change.
+
+Topic 4: Observability
+Three signals.
+• Logs: individual events as lines of text, with no built-in link between lines. With 50 requests running at once, log lines interleave and you can't tell which belongs to which request.
+• Metrics: numbers aggregated over time, like p95 latency, error rate, tokens per request, cost. They tell you that something changed, and when.
+• Traces: one request's journey. A trace ties everything for that request together under a single trace ID, as a tree of timed steps called spans.
+What a RAG trace looks like. Request → FastAPI → RAG, which contains Query transformation, Retrieval, Reranking, and the LLM call → Response. You can see where the time went and which step failed. A slow request becomes easy to diagnose: open its trace and see the reranker took 6 of the 8 seconds.
+What to track per request: latency (per stage), tokens, cost, retrieval quality, errors, and the LLM response.
+The debugging rhythm. Metrics tell you something is wrong and when. Traces show where. Logs show the details.
+• Error rate jumped from 1% to 10% at 3 pm: spot it on the metrics dashboard, then open traces from around 3 pm filtered for failures to see which step broke (say the LLM call timing out), then read the logs for the exact error message.
+• p95 latency doubled this morning: check the metric to confirm when it started, then open slow traces and look at the spans to see which step grew, then ask what changed around that time.
+OpenTelemetry (OTel). An open standard for producing traces, metrics and logs. Think USB-C: without it, every tool (LangSmith, Datadog, Grafana, Galileo) has its own plug, and switching tools means rewriting your instrumentation. With OTel you instrument the FastAPI app once, and the data can flow to any backend. Change tools later and you change where the data is sent, not your code. It is the same idea as MCP: a shared protocol so you don't build a custom connection for every pair.
+Distributed tracing. One request crosses several services: FastAPI, the vector database, the LLM provider. A trace ID travels along with the request like a baton, so every service adds its spans to the same trace, and they join into one trace instead of separate fragments.
+# Sketch only: verify package names and setup against current OpenTelemetry docs
+from opentelemetry import trace
+
+tracer = trace.get_tracer("rag-api")
+
+async def answer(question: str):
+    with tracer.start_as_current_span("rag.answer"):
+        with tracer.start_as_current_span("rag.retrieve"):
+            chunks = await retrieval_service.retrieve(question)
+        with tracer.start_as_current_span("rag.llm") as span:
+            response = await llm_client.call(question, chunks)
+            span.set_attribute("llm.total_tokens", response.usage.total_tokens)
+        return response.text
+
+Topic 5: Caching
+Why cache. If 1,000 users ask "What's the refund policy?" in an hour, without caching every one runs the full pipeline: more tokens and money, more latency since every user waits for the whole thing, and more load on the embedding model, database and reranker. For identical questions that is mostly wasted work.
+Redis. The usual tool: a very fast in-memory key-value store.
+Three kinds of cache.
+Type
+What it stores
+Skips
+Response cache
+The final answer for a question (exact match)
+The whole pipeline
+Embedding cache
+The vector for a piece of text
+A repeat embedding call for the same query or chunk
+Semantic cache
+Answers keyed by the meaning of the question
+The pipeline, even when the wording differs
+How a semantic cache works. It sits in front of the pipeline. It compares the new question's embedding to earlier questions, and if one is similar enough, returns the stored answer without calling the LLM at all. "Refund policy?" and "how do I get my money back?" can share one answer.
+The danger. Embeddings can score two questions as nearly identical when one small word changes the answer: "refund window for the basic plan?" vs. "for the premium plan?" are one word apart, so the cache may serve the premium answer to a basic-plan user, confidently and instantly. The strength (matching by meaning) and the risk come from the same feature. Defences:
+• A stricter similarity threshold.
+• Put plan, user, or document version in the cache key, so they must match exactly.
+• Avoid semantic caching where precision matters.
+• Note: LLM-as-judge is an evaluation tool, not the usual fix for this.
+TTL and invalidation. TTL (time to live) is how long an entry is kept before it expires. Invalidation is deleting entries when the underlying data changes.
+Scenario: the refund policy changes from 14 to 30 days, but the cache holds the old answer with an hour of TTL left. Until it is removed, the cache keeps serving the stale 14-day answer, instantly and confidently. The fix is to invalidate only the entries that depended on that document, triggered by re-ingestion. Two ways, using Week 3 versioning:
+• Store the document ID with each cached answer, so the ingestion worker deletes just those entries when the content hash changes.
+• Put the document version in the cache key, so the new version never matches old entries, which expire through TTL.
+TTL is the safety net: if an invalidation is ever missed, the stale entry still expires instead of living forever. Invalidation on change is the main fix, TTL is the backup.
+# Sketch only: verify against the redis-py docs
+import hashlib, json, redis
+
+r = redis.Redis()
+
+def cache_key(question: str, doc_version: int) -> str:
+    return "answer:" + hashlib.sha256(f"{doc_version}:{question}".encode()).hexdigest()
+
+def get_or_compute(question: str, doc_version: int, compute):
+    key = cache_key(question, doc_version)
+    cached = r.get(key)
+    if cached:
+        return json.loads(cached)
+    result = compute(question)
+    r.setex(key, 3600, json.dumps(result))  # TTL: 1 hour
+    return result
+
+Topic 6: Week 4 Project and the Outcome Question
+Project. Take the Week 3 RAG system and add: LangSmith tracing, an evaluation dataset, Ragas/DeepEval scoring, metrics, and Redis caching.
+Build order:
+1. Tracing: every request shows as a trace in LangSmith, with a span per stage (rewrite, retrieval, rerank, LLM) and tokens, latency and cost recorded.
+2. Golden dataset: about 30 to 50 realistic questions with ideal answers, covering different question types (exact codes, paraphrases, multi-fact questions).
+3. Experiments: run the pipeline over the dataset and score with evaluators (Ragas/DeepEval judges for faithfulness, answer relevance, context precision and recall). Record a baseline.
+4. Metrics: track p95 latency, error rate, tokens and cost per request.
+5. Redis caching: response cache first, then embedding cache. Add semantic caching carefully, with a strict threshold and plan/user/version in the key. Invalidate on re-ingestion, with TTL as the safety net.
+6. Compare: rerun the experiment after each change and compare against the baseline.
+Outcome question: "Your RAG system suddenly became worse. How do you debug it?"
+A polished answer, in order:
+1. Symptoms first: which metric moved, and since when? Quality metrics (precision, recall, faithfulness, answer relevance) or operational ones (latency, errors, cost, tokens)? Check the metrics dashboard.
+2. What changed, and when? A sudden drop almost always has a trigger, even with no code deploy: new documents or a bad re-ingestion, a chunk size or number-of-chunks setting, an embedding model swap without re-embedding old chunks, an edited prompt, or the provider updating the LLM version behind the same name.
+3. Isolate the stage using the metric that moved:
+    ◦ Recall down: first-stage retrieval, chunking, embeddings, query rewriting, or missing data.
+    ◦ Precision down: reranker, too many chunks kept, junk or stale data in the database.
+    ◦ Faithfulness or answer relevance down while retrieval metrics hold: generation, so prompt or model version.
+    ◦ Latency or cost up: per-stage spans and token counts.
+4. Confirm with evidence: rerun the golden dataset as a new experiment, compare with the earlier good one to find the questions that got worse, then open their traces and compare a good trace with a bad one (prompt, model version, chunks that reached the prompt).
+5. Fix or roll back, then re-run the experiment to verify the fix.
+6. Prevent a repeat: run the golden dataset automatically before every change ships, so a regression is caught before users see it.
+Note the placement of causes: an LLM version change is a generation-side cause, while chunking, embeddings and how many chunks are fetched are retrieval-side.
+
+Quick Self-Check
+1. Why do RAG systems need separate retrieval and generation metrics?
+2. Retrieved chunks are all correct but the answer is wrong. Which stage is at fault and which metric catches it?
+3. If 2 of 5 retrieved chunks are useful, what is the context precision? What does context recall measure?
+4. You raise retrieved chunks from 5 to 20. What happens to recall and precision, and which component brings precision back?
+5. Can the reranker fix low recall? Why not?
+6. Faithfulness is high but answer relevance is low. What does the answer look like?
+7. Cost doubled overnight with no code change. Name three possible causes.
+8. What does p95 = 20 seconds mean, and why is it more useful than the average?
+9. Trace, dataset, experiment, evaluator: define each in one sentence.
+10. A user complains about one bad answer, and separately you want to know if a new prompt is better overall. Which tool do you use for each?
+11. How does LLM-as-judge work, and why shouldn't you trust a score blindly?
+12. Do Ragas and DeepEval need traces to work?
+13. Is LangSmith open source? What is the free option for learning, and name an open-source alternative.
+14. Logs vs metrics vs traces: what does each tell you? What is a span?
+15. Your error rate jumped at 3 pm. Walk through which signal you use at each step.
+16. What problem does OpenTelemetry solve, and what does "distributed" mean in distributed tracing?
+17. Name the three kinds of cache and what each skips.
+18. Why can a semantic cache serve a wrong answer, and how do you defend against it?
+19. A document was updated but the cache holds the old answer with an hour of TTL left. What goes wrong, how do you fix it, and what is the TTL for?
+20. "Your RAG system suddenly became worse. How do you debug it?" Give a full answer.
+Weak spots to revisit: (a) recall vs precision when the number of retrieved chunks changes, (b) the p95 definition, (c) keeping dataset, experiment and evaluator roles distinct (and trace vs experiment).
+Note: Week 4 concepts are covered. Hands-on builds for Weeks 1 to 4 are still to do. Code snippets here are sketches, so verify package names and imports against current docs and report any runtime errors.
